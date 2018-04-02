@@ -1,94 +1,137 @@
 import sys
-from functools import wraps
-from types import coroutine
+from functools import wraps, partial
+from types import coroutine, CodeType
 import inspect
 from inspect import (
     getcoroutinestate, CORO_CREATED, CORO_CLOSED, CORO_SUSPENDED
 )
 import collections.abc
 
+# An async generator object (whether native in 3.6+ or the pure-Python
+# version implemented below) is basically an async function with some
+# extra wrapping logic. As an async function, it can call other async
+# functions, which will probably at some point call a function that uses
+# 'yield' to send traps to the event loop. Async generators also need
+# to be able to send values to the context in which the generator is
+# being iterated, and it's awfully convenient to be able to do that
+# using 'yield' too. To distinguish between these two streams of
+# yielded objects, the traps intended for the event loop are yielded
+# as-is, and the values intended for the context that's iterating the
+# generator are wrapped in some wrapper object (YieldWrapper here, or
+# an internal Python type called AsyncGenWrappedValue in the native
+# async generator implementation) before being yielded.
+# The __anext__(), asend(), and athrow() methods of an async generator
+# iterate the underlying async function until a wrapped value is received,
+# and any unwrapped values are passed through to the event loop.
 
-class YieldWrapper:
-    def __init__(self, payload):
-        self.payload = payload
+# These functions are syntactically valid only on 3.6+, so we conditionally
+# exec() the code defining them.
+_native_asyncgen_helpers = """
+async def _wrapper():
+    holder = [None]
+    while True:
+        # The simpler "value = None; while True: value = yield value"
+        # would hold a reference to the most recently wrapped value
+        # after it has been yielded out (until the next value to wrap
+        # comes in), so we use a one-element list instead.
+        holder.append((yield holder.pop()))
+_wrapper = _wrapper()
 
+async def _unwrapper():
+    @coroutine
+    def inner():
+        holder = [None]
+        while True:
+            holder.append((yield holder.pop()))
+    await inner()
+    yield None
+_unwrapper = _unwrapper()
+"""
 
-def _wrap(value):
-    return YieldWrapper(value)
+if sys.implementation.name == "cpython" and sys.version_info >= (3, 6):
+    # On 3.6, with native async generators, we want to use the same
+    # wrapper type that native generators use. This lets @async_generator
+    # create a native async generator under most circumstances, which
+    # improves performance while still permitting 3.5-compatible syntax.
+    # It also lets non-native @async_generators (e.g. those that return
+    # non-None values) yield_from_ native ones and vice versa.
 
+    import ctypes
+    from types import AsyncGeneratorType, GeneratorType
+    exec(_native_asyncgen_helpers)
 
-def _is_wrapped(box):
-    return isinstance(box, YieldWrapper)
+    # Transmute _wrapper to a regular generator object by modifying the
+    # ob_type field. The code object inside _wrapper will still think it's
+    # associated with an async generator, so it will yield out
+    # AsyncGenWrappedValues when it encounters a 'yield' statement;
+    # but the generator object will think it's a normal non-async
+    # generator, so it won't unwrap them. This way, we can obtain
+    # AsyncGenWrappedValues as normal manipulable Python objects.
+    #
+    # This sort of object type transmutation is categorically a Sketchy
+    # Thing To Do, because the functions associated with the new type
+    # (including tp_dealloc and so forth) will be operating on a
+    # structure whose in-memory layout matches that of the old type.
+    # In this case, it's OK, because async generator objects are just
+    # generator objects plus a few extra fields at the end; and these
+    # fields are two integers and a NULL-until-first-iteration object
+    # pointer, so they don't hold any resources that need to be cleaned up.
+    # We have a unit test that verifies that __sizeof__() for generators
+    # and async generators continues to follow this pattern in future
+    # Python versions.
 
+    _type_p = ctypes.c_ulong.from_address(
+        id(_wrapper) + ctypes.sizeof(ctypes.c_ulong)
+    )
+    assert _type_p.value == id(AsyncGeneratorType)
+    _type_p.value = id(GeneratorType)
 
-def _unwrap(box):
-    return box.payload
+    supports_native_asyncgens = True
 
+    # Now _wrapper.send(x) returns an AsyncGenWrappedValue of x.
+    # We have to initially send(None) since the generator was just constructed;
+    # we look at the type of the return value (which is AsyncGenWrappedValue(None))
+    # to help with _is_wrapped.
+    YieldWrapper = type(_wrapper.send(None))
 
-# This is the magic code that lets you use yield_ and yield_from_ with native
-# generators.
-#
-# The old version worked great on Linux and MacOS, but not on Windows, because
-# it depended on _PyAsyncGenValueWrapperNew. The new version segfaults
-# everywhere, and I'm not sure why -- probably my lack of understanding
-# of ctypes and refcounts.
-#
-# There are also some commented out tests that should be re-enabled if this is
-# fixed:
-#
-# if sys.version_info >= (3, 6):
-#     # Use the same box type that the interpreter uses internally. This allows
-#     # yield_ and (more importantly!) yield_from_ to work in built-in
-#     # generators.
-#     import ctypes  # mua ha ha.
-#
-#     # We used to call _PyAsyncGenValueWrapperNew to create and set up new
-#     # wrapper objects, but that symbol isn't available on Windows:
-#     #
-#     #   https://github.com/python-trio/async_generator/issues/5
-#     #
-#     # Fortunately, the type object is available, but it means we have to do
-#     # this the hard way.
-#
-#     # We don't actually need to access this, but we need to make a ctypes
-#     # structure so we can call addressof.
-#     class _ctypes_PyTypeObject(ctypes.Structure):
-#         pass
-#     _PyAsyncGenWrappedValue_Type_ptr = ctypes.addressof(
-#         _ctypes_PyTypeObject.in_dll(
-#             ctypes.pythonapi, "_PyAsyncGenWrappedValue_Type"))
-#     _PyObject_GC_New = ctypes.pythonapi._PyObject_GC_New
-#     _PyObject_GC_New.restype = ctypes.py_object
-#     _PyObject_GC_New.argtypes = (ctypes.c_void_p,)
-#
-#     _Py_IncRef = ctypes.pythonapi.Py_IncRef
-#     _Py_IncRef.restype = None
-#     _Py_IncRef.argtypes = (ctypes.py_object,)
-#
-#     class _ctypes_PyAsyncGenWrappedValue(ctypes.Structure):
-#         _fields_ = [
-#             ('PyObject_HEAD', ctypes.c_byte * object().__sizeof__()),
-#             ('agw_val', ctypes.py_object),
-#         ]
-#     def _wrap(value):
-#         box = _PyObject_GC_New(_PyAsyncGenWrappedValue_Type_ptr)
-#         raw = ctypes.cast(ctypes.c_void_p(id(box)),
-#                           ctypes.POINTER(_ctypes_PyAsyncGenWrappedValue))
-#         raw.contents.agw_val = value
-#         _Py_IncRef(value)
-#         return box
-#
-#     def _unwrap(box):
-#         assert _is_wrapped(box)
-#         raw = ctypes.cast(ctypes.c_void_p(id(box)),
-#                           ctypes.POINTER(_ctypes_PyAsyncGenWrappedValue))
-#         value = raw.contents.agw_val
-#         _Py_IncRef(value)
-#         return value
-#
-#     _PyAsyncGenWrappedValue_Type = type(_wrap(1))
-#     def _is_wrapped(box):
-#         return isinstance(box, _PyAsyncGenWrappedValue_Type)
+    # Advance _unwrapper to its first yield statement, for use by _unwrap().
+    _unwrapper.asend(None).send(None)
+
+    # Performance note: compared to the non-native-supporting implementation below,
+    # this _wrap() is about the same speed (434 +- 16 nsec here, 456 +- 24 nsec below)
+    # but this _unwrap() is much slower (1.17 usec vs 167 nsec). Since _unwrap is only
+    # needed on non-native generators, and we plan to have most @async_generators use
+    # native generators on 3.6+, this seems acceptable.
+
+    _wrap = _wrapper.send
+
+    def _is_wrapped(box):
+        return isinstance(box, YieldWrapper)
+
+    def _unwrap(box):
+        try:
+            _unwrapper.asend(box).send(None)
+        except StopIteration as e:
+            return e.value
+        else:
+            raise TypeError("not wrapped")
+else:
+    supports_native_asyncgens = False
+
+    class YieldWrapper:
+        __slots__ = ("payload",)
+
+        def __init__(self, payload):
+            self.payload = payload
+
+    def _wrap(value):
+        return YieldWrapper(value)
+
+    def _is_wrapped(box):
+        return isinstance(box, YieldWrapper)
+
+    def _unwrap(box):
+        return box.payload
 
 
 # The magic @coroutine decorator is how you write the bottom level of
@@ -225,11 +268,58 @@ class ANextIter:
             return result
 
 
+UNSPECIFIED = object()
+try:
+    from sys import get_asyncgen_hooks, set_asyncgen_hooks
+
+except ImportError:
+    import threading
+
+    asyncgen_hooks = collections.namedtuple(
+        "asyncgen_hooks", ("firstiter", "finalizer")
+    )
+
+    class _hooks_storage(threading.local):
+        def __init__(self):
+            self.firstiter = None
+            self.finalizer = None
+
+    _hooks = _hooks_storage()
+
+    def get_asyncgen_hooks():
+        return asyncgen_hooks(
+            firstiter=_hooks.firstiter, finalizer=_hooks.finalizer
+        )
+
+    def set_asyncgen_hooks(firstiter=UNSPECIFIED, finalizer=UNSPECIFIED):
+        if firstiter is not UNSPECIFIED:
+            if firstiter is None or callable(firstiter):
+                _hooks.firstiter = firstiter
+            else:
+                raise TypeError(
+                    "callable firstiter expected, got {}".format(
+                        type(firstiter).__name__
+                    )
+                )
+
+        if finalizer is not UNSPECIFIED:
+            if finalizer is None or callable(finalizer):
+                _hooks.finalizer = finalizer
+            else:
+                raise TypeError(
+                    "callable finalizer expected, got {}".format(
+                        type(finalizer).__name__
+                    )
+                )
+
+
 class AsyncGenerator:
-    def __init__(self, coroutine):
+    def __init__(self, coroutine, *, warn_on_native_differences=False):
         self._coroutine = coroutine
+        self._warn_on_native_differences = warn_on_native_differences
         self._it = coroutine.__await__()
-        self.ag_running = False
+        self._running = False
+        self._finalizer = None
 
     # On python 3.5.0 and 3.5.1, __aiter__ must be awaitable.
     # Starting in 3.5.2, it should not be awaitable, and if it is, then it
@@ -259,24 +349,53 @@ class AsyncGenerator:
     def ag_frame(self):
         return self._coroutine.cr_frame
 
+    @property
+    def ag_await(self):
+        return self._coroutine.cr_await
+
+    @property
+    def ag_running(self):
+        if self._running != self._coroutine.cr_running and self._warn_on_native_differences:
+            import warnings
+            warnings.warn(
+                "Native async generators incorrectly set ag_running = False "
+                "when the generator is awaiting a trap to the event loop and "
+                "not suspended via a yield to its caller. Your code examines "
+                "ag_running under such conditions, and will change behavior "
+                "when async_generator starts using native generators by default "
+                "(where available) in the next release. "
+                "Use @async_generator_legacy to keep the current behavior, or "
+                "@async_generator_native if you're OK with the change.",
+                category=FutureWarning,
+                stacklevel=2
+            )
+        return self._running
+
     ################################################################
     # Core functionality
     ################################################################
 
-    # We make these async functions and use await, rather than just regular
-    # functions that pass back awaitables, in order to get more useful
-    # tracebacks when debugging.
+    # These need to return awaitables, rather than being async functions,
+    # to match the native behavior where the firstiter hook is called
+    # immediately on asend()/etc, even if the coroutine that asend()
+    # produces isn't awaited for a bit.
 
-    async def __anext__(self):
-        return await self._do_it(self._it.__next__)
+    def __anext__(self):
+        return self._do_it(self._it.__next__)
 
-    async def asend(self, value):
-        return await self._do_it(self._it.send, value)
+    def asend(self, value):
+        return self._do_it(self._it.send, value)
 
-    async def athrow(self, type, value=None, traceback=None):
-        return await self._do_it(self._it.throw, type, value, traceback)
+    def athrow(self, type, value=None, traceback=None):
+        return self._do_it(self._it.throw, type, value, traceback)
 
-    async def _do_it(self, start_fn, *args):
+    def _do_it(self, start_fn, *args):
+        coro_state = getcoroutinestate(self._coroutine)
+        if coro_state is CORO_CREATED:
+            (firstiter, self._finalizer) = get_asyncgen_hooks()
+            if firstiter is not None:
+                firstiter(self)
+
         # On CPython 3.5.2 (but not 3.5.0), coroutines get cranky if you try
         # to iterate them after they're exhausted. Generators OTOH just raise
         # StopIteration. We want to convert the one into the other, so we need
@@ -285,11 +404,16 @@ class AsyncGenerator:
             raise StopAsyncIteration()
         if self.ag_running:
             raise ValueError("async generator already executing")
-        try:
-            self.ag_running = True
-            return await ANextIter(self._it, start_fn, *args)
-        finally:
-            self.ag_running = False
+
+        @wraps(start_fn)
+        async def do_it_async():
+            try:
+                self._running = True
+                return await ANextIter(self._it, start_fn, *args)
+            finally:
+                self._running = False
+
+        return do_it_async()
 
     ################################################################
     # Cleanup
@@ -317,22 +441,132 @@ class AsyncGenerator:
             # never awaited" message.
             self._coroutine.close()
         if getcoroutinestate(self._coroutine) is CORO_SUSPENDED:
-            # This exception will get swallowed because this is __del__, but
-            # it's an easy way to trigger the print-to-console logic
-            raise RuntimeError(
-                "partially-exhausted async_generator {!r} garbage collected"
-                .format(self._coroutine.cr_frame.f_code.co_name)
-            )
+            if self._finalizer is not None:
+                self._finalizer(self)
+            else:
+                # Mimic the behavior of native generators on GC with no finalizer:
+                # throw in GeneratorExit, run for one turn, and complain if it didn't
+                # finish.
+                try:
+                    self.athrow(GeneratorExit).send(None)
+                except (GeneratorExit, StopAsyncIteration):
+                    pass
+                except StopIteration:
+                    raise RuntimeError("async_generator ignored GeneratorExit")
+                else:
+                    raise RuntimeError(
+                        "async_generator {!r} awaited during finalization; install "
+                        "a finalization hook to support this, or wrap it in "
+                        "'async with aclosing(...):'"
+                        .format(self.ag_code.co_name)
+                    )
 
 
 if hasattr(collections.abc, "AsyncGenerator"):
     collections.abc.AsyncGenerator.register(AsyncGenerator)
 
 
-def async_generator(coroutine_maker):
-    @wraps(coroutine_maker)
+def _find_return_of_not_none(co):
+    """Inspect the code object *co* for the presence of return statements that
+    might return a value other than None. If any such statement is found,
+    return the source line number (in file ``co.co_filename``) on which it occurs.
+    If all return statements definitely return the value None, return None.
+    """
+
+    # 'return X' for simple/constant X seems to always compile to
+    # LOAD_CONST + RETURN_VALUE immediately following one another,
+    # and LOAD_CONST(None) + RETURN_VALUE definitely does mean return None,
+    # so we'll search for RETURN_VALUE not preceded by LOAD_CONST or preceded
+    # by a LOAD_CONST that does not load None.
+    import dis
+    current_line = co.co_firstlineno
+    prev_inst = None
+    for inst in dis.Bytecode(co):
+        if inst.starts_line is not None:
+            current_line = inst.starts_line
+        if inst.opname == "RETURN_VALUE" and (prev_inst is None or
+                                              prev_inst.opname != "LOAD_CONST"
+                                              or prev_inst.argval is not None):
+            return current_line
+        prev_inst = inst
+    return None
+
+
+def _convert_to_native_asyncgen_function(afn):
+    """Convert the non-generator async function *afn*, which contains some ``await yield_(...)``
+    and/or ``await yield_from_(...)`` calls, to a native async generator function.
+    *afn* must not return values other than None; doing so is likely to crash the interpreter.
+    Use :func:`_find_return_of_not_none` to check this.
+    """
+
+    # An async function that contains 'await yield_()' statements is a perfectly
+    # cromulent async generator, except that it doesn't get marked with CO_ASYNC_GENERATOR
+    # because it doesn't contain any 'yield' statements. Create a new code object that
+    # does have CO_ASYNC_GENERATOR set. This is preferable to using a wrapper because
+    # it makes ag_code and ag_frame work the same way they would for a native async
+    # generator with 'yield' statements, and the same as for an async_generator
+    # asyncgen with allow_native=False.
+
+    from inspect import CO_COROUTINE, CO_ASYNC_GENERATOR
+    co = afn.__code__
+    afn.__code__ = CodeType(
+        co.co_argcount, co.co_kwonlyargcount, co.co_nlocals, co.co_stacksize,
+        (co.co_flags & ~CO_COROUTINE) | CO_ASYNC_GENERATOR, co.co_code,
+        co.co_consts, co.co_names, co.co_varnames, co.co_filename, co.co_name,
+        co.co_firstlineno, co.co_lnotab, co.co_freevars, co.co_cellvars
+    )
+
+
+def async_generator(afn=None, *, allow_native=None, uses_return=None):
+    if afn is None:
+        return partial(
+            async_generator,
+            uses_return=uses_return,
+            allow_native=allow_native
+        )
+
+    if not inspect.iscoroutinefunction(afn):
+        raise TypeError(
+            "expected an async function, not {!r}".format(type(afn).__name__)
+        )
+
+    if sys.implementation.name == "cpython":
+        # 'return' statements with non-None arguments are syntactically forbidden when
+        # compiling a true async generator, but the flags mutation in
+        # _convert_to_native_asyncgen_function sidesteps that check, which could raise
+        # an assertion in genobject.c when a non-None return is executed.
+        # To avoid crashing the interpreter due to a user error, we need to examine the
+        # code of the function we're converting.
+
+        co = afn.__code__
+        nontrivial_return_line = _find_return_of_not_none(co)
+        seems_to_use_return = nontrivial_return_line is not None
+        if uses_return is None:
+            uses_return = seems_to_use_return
+        elif uses_return != seems_to_use_return:
+            prefix = "{} declared using @async_generator(uses_return={}) but ".format(
+                afn.__qualname__, uses_return
+            )
+            if seems_to_use_return:
+                raise RuntimeError(
+                    prefix + "might return a value other than None at {}:{}".
+                    format(co.co_filename, nontrivial_return_line)
+                )
+            else:
+                raise RuntimeError(
+                    prefix + "never returns a value other than None"
+                )
+
+        if allow_native and not uses_return and supports_native_asyncgens:
+            _convert_to_native_asyncgen_function(afn)
+            return afn
+
+    @wraps(afn)
     def async_generator_maker(*args, **kwargs):
-        return AsyncGenerator(coroutine_maker(*args, **kwargs))
+        return AsyncGenerator(
+            afn(*args, **kwargs),
+            warn_on_native_differences=(allow_native is not False)
+        )
 
     async_generator_maker._async_gen_function = id(async_generator_maker)
     return async_generator_maker

@@ -1,18 +1,17 @@
 import pytest
 
-from .. import aclosing, async_generator, yield_, asynccontextmanager
+from .. import aclosing, yield_, asynccontextmanager, supports_native_asyncgens
 
 
-@async_generator
-async def async_range(count, closed_slot):
-    try:
-        for i in range(count):  # pragma: no branch
-            await yield_(i)
-    except GeneratorExit:
-        closed_slot[0] = True
+async def test_aclosing(async_generator):
+    @async_generator
+    async def async_range(count, closed_slot):
+        try:
+            for i in range(count):  # pragma: no branch
+                await yield_(i)
+        except GeneratorExit:
+            closed_slot[0] = True
 
-
-async def test_aclosing():
     closed_slot = [False]
     async with aclosing(async_range(10, closed_slot)) as gen:
         it = iter(range(10))
@@ -35,7 +34,9 @@ async def test_aclosing():
     assert closed_slot[0]
 
 
-async def test_contextmanager_do_not_unchain_non_stopiteration_exceptions():
+async def test_contextmanager_do_not_unchain_non_stopiteration_exceptions(
+        async_generator
+):
     @asynccontextmanager
     @async_generator
     async def manager_issue29692():
@@ -78,8 +79,7 @@ async def test_contextmanager_do_not_unchain_non_stopiteration_exceptions():
 
 
 # Native async generators are only available from Python 3.6 and onwards
-nativeasyncgenerators = True
-try:
+if supports_native_asyncgens:
     exec(
         """
 @asynccontextmanager
@@ -90,12 +90,10 @@ async def manager_issue29692_2():
         raise RuntimeError('issue29692:Chained') from exc
 """
     )
-except SyntaxError:
-    nativeasyncgenerators = False
 
 
 @pytest.mark.skipif(
-    not nativeasyncgenerators,
+    not supports_native_asyncgens,
     reason="Python < 3.6 doesn't have native async generators"
 )
 async def test_native_contextmanager_do_not_unchain_non_stopiteration_exceptions(
@@ -115,7 +113,7 @@ async def test_native_contextmanager_do_not_unchain_non_stopiteration_exceptions
         assert excinfo.value.__cause__ is None
 
 
-async def test_asynccontextmanager_exception_passthrough():
+async def test_asynccontextmanager_exception_passthrough(async_generator):
     # This was the cause of annoying coverage flapping, see gh-140
     @asynccontextmanager
     @async_generator
@@ -132,7 +130,7 @@ async def test_asynccontextmanager_exception_passthrough():
         pass
 
 
-async def test_asynccontextmanager_catches_exception():
+async def test_asynccontextmanager_catches_exception(async_generator):
     @asynccontextmanager
     @async_generator
     async def catch_it():
@@ -143,7 +141,7 @@ async def test_asynccontextmanager_catches_exception():
         raise ValueError
 
 
-async def test_asynccontextmanager_different_exception():
+async def test_asynccontextmanager_different_exception(async_generator):
     @asynccontextmanager
     @async_generator
     async def switch_it():
@@ -157,7 +155,7 @@ async def test_asynccontextmanager_different_exception():
             raise KeyError
 
 
-async def test_asynccontextmanager_nice_message_on_sync_enter():
+async def test_asynccontextmanager_nice_message_on_sync_enter(async_generator):
     @asynccontextmanager
     @async_generator
     async def xxx():  # pragma: no cover
@@ -175,7 +173,7 @@ async def test_asynccontextmanager_nice_message_on_sync_enter():
         pass
 
 
-async def test_asynccontextmanager_no_yield():
+async def test_asynccontextmanager_no_yield(async_generator):
     @asynccontextmanager
     @async_generator
     async def yeehaw():
@@ -188,7 +186,7 @@ async def test_asynccontextmanager_no_yield():
     assert "didn't yield" in str(excinfo.value)
 
 
-async def test_asynccontextmanager_too_many_yields():
+async def test_asynccontextmanager_too_many_yields(async_generator):
     closed_count = 0
 
     @asynccontextmanager
