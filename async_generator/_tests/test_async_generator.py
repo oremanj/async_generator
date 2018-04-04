@@ -110,6 +110,8 @@ async def test_bad_return_value(async_generator):
         assert e.args[0] == "hi"
 
 
+@pytest.mark.skipif(sys.implementation.name != "cpython",
+                    reason="relies on bytecode inspection")
 async def test_bad_return_detection():
     from .. import async_generator
 
@@ -976,6 +978,8 @@ def test_gc_hooks_interface(local_asyncgen_hooks):
     assert get_asyncgen_hooks() == (one, two)
 
 
+@pytest.mark.skipif(sys.implementation.name == "pypy",
+                    reason="segfaults - currently investigating why")
 async def test_gc_hooks_behavior(async_generator, local_asyncgen_hooks):
     events = []
     to_finalize = []

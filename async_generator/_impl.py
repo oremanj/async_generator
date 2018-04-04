@@ -80,8 +80,8 @@ if sys.implementation.name == "cpython" and sys.version_info >= (3, 6):
     # and async generators continues to follow this pattern in future
     # Python versions.
 
-    _type_p = ctypes.c_ulong.from_address(
-        id(_wrapper) + ctypes.sizeof(ctypes.c_ulong)
+    _type_p = ctypes.c_size_t.from_address(
+        id(_wrapper) + ctypes.sizeof(ctypes.c_size_t)
     )
     assert _type_p.value == id(AsyncGeneratorType)
     _type_p.value = id(GeneratorType)
@@ -447,8 +447,9 @@ class AsyncGenerator:
                 # Mimic the behavior of native generators on GC with no finalizer:
                 # throw in GeneratorExit, run for one turn, and complain if it didn't
                 # finish.
+                thrower = self.athrow(GeneratorExit)
                 try:
-                    self.athrow(GeneratorExit).send(None)
+                    thrower.send(None)
                 except (GeneratorExit, StopAsyncIteration):
                     pass
                 except StopIteration:
@@ -460,6 +461,8 @@ class AsyncGenerator:
                         "'async with aclosing(...):'"
                         .format(self.ag_code.co_name)
                     )
+                finally:
+                    thrower.close()
 
 
 if hasattr(collections.abc, "AsyncGenerator"):
