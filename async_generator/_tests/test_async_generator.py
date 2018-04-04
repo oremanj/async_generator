@@ -118,13 +118,13 @@ async def test_bad_return_detection():
     with pytest.raises(RuntimeError):
 
         @async_generator(uses_return=False)
-        async def agen():
+        async def agen():    # pragma: no cover
             return 42
 
     with pytest.raises(RuntimeError):
 
         @async_generator(uses_return=False)
-        async def agen():
+        async def agen():    # pragma: no cover
             if await yield_(1):
                 return await yield_(2)
             await yield_(3)
@@ -132,7 +132,7 @@ async def test_bad_return_detection():
     with pytest.raises(RuntimeError):
 
         @async_generator(uses_return=True)
-        async def agen():
+        async def agen():    # pragma: no cover
             if await yield_(1):
                 await yield_(2)
                 return None
@@ -831,7 +831,7 @@ def test_refcnt():
     not supports_native_asyncgens, reason="relevant to native asyncgens only"
 )
 def test_gen_agen_size():
-    def gen():
+    def gen():    # pragma: no cover
         yield 42
 
     dct = {}
@@ -909,14 +909,14 @@ def test_asyncgen_type_error(async_generator):
     with pytest.raises(TypeError) as info:
 
         @async_generator
-        def whoops1():
+        def whoops1():    # pragma: no cover
             pass
 
     assert "expected an async function, not 'function'" in str(info.value)
 
     with pytest.raises(TypeError) as info:
 
-        def whoops2():
+        def whoops2():    # pragma: no cover
             yield
 
         async_generator(whoops2())
@@ -938,10 +938,10 @@ def local_asyncgen_hooks():
 
 
 def test_gc_hooks_interface(local_asyncgen_hooks):
-    def one(agen):
+    def one(agen):    # pragma: no cover
         pass
 
-    def two(agen):
+    def two(agen):    # pragma: no cover
         pass
 
     set_asyncgen_hooks(None, None)
@@ -1007,7 +1007,8 @@ async def test_gc_hooks_behavior(async_generator, local_asyncgen_hooks):
             await yield_(3)
         finally:
             events.append("unwind 3 {}".format(ident))
-        events.append("done {}".format(ident))
+        # this one is included to make sure we _don't_ execute it
+        events.append("done {}".format(ident))    # pragma: no cover
 
     async def anext_verbosely(iter, ident):
         events.append("before asend {}".format(ident))
