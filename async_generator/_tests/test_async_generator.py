@@ -110,21 +110,23 @@ async def test_bad_return_value(async_generator):
         assert e.args[0] == "hi"
 
 
-@pytest.mark.skipif(sys.implementation.name != "cpython",
-                    reason="relies on bytecode inspection")
+@pytest.mark.skipif(
+    sys.implementation.name != "cpython",
+    reason="relies on bytecode inspection"
+)
 async def test_bad_return_detection():
     from .. import async_generator
 
     with pytest.raises(RuntimeError):
 
         @async_generator(uses_return=False)
-        async def agen():    # pragma: no cover
+        async def agen():  # pragma: no cover
             return 42
 
     with pytest.raises(RuntimeError):
 
         @async_generator(uses_return=False)
-        async def agen():    # pragma: no cover
+        async def agen():  # pragma: no cover
             if await yield_(1):
                 return await yield_(2)
             await yield_(3)
@@ -132,7 +134,7 @@ async def test_bad_return_detection():
     with pytest.raises(RuntimeError):
 
         @async_generator(uses_return=True)
-        async def agen():    # pragma: no cover
+        async def agen():  # pragma: no cover
             if await yield_(1):
                 await yield_(2)
                 return None
@@ -831,7 +833,7 @@ def test_refcnt():
     not supports_native_asyncgens, reason="relevant to native asyncgens only"
 )
 def test_gen_agen_size():
-    def gen():    # pragma: no cover
+    def gen():  # pragma: no cover
         yield 42
 
     dct = {}
@@ -909,14 +911,14 @@ def test_asyncgen_type_error(async_generator):
     with pytest.raises(TypeError) as info:
 
         @async_generator
-        def whoops1():    # pragma: no cover
+        def whoops1():  # pragma: no cover
             pass
 
     assert "expected an async function, not 'function'" in str(info.value)
 
     with pytest.raises(TypeError) as info:
 
-        def whoops2():    # pragma: no cover
+        def whoops2():  # pragma: no cover
             yield
 
         async_generator(whoops2())
@@ -938,10 +940,10 @@ def local_asyncgen_hooks():
 
 
 def test_gc_hooks_interface(local_asyncgen_hooks):
-    def one(agen):    # pragma: no cover
+    def one(agen):  # pragma: no cover
         pass
 
-    def two(agen):    # pragma: no cover
+    def two(agen):  # pragma: no cover
         pass
 
     set_asyncgen_hooks(None, None)
@@ -978,8 +980,10 @@ def test_gc_hooks_interface(local_asyncgen_hooks):
     assert get_asyncgen_hooks() == (one, two)
 
 
-@pytest.mark.skipif(sys.implementation.name == "pypy",
-                    reason="segfaults - currently investigating why")
+@pytest.mark.skipif(
+    sys.implementation.name == "pypy",
+    reason="segfaults - currently investigating why"
+)
 async def test_gc_hooks_behavior(async_generator, local_asyncgen_hooks):
     events = []
     to_finalize = []
@@ -1008,7 +1012,7 @@ async def test_gc_hooks_behavior(async_generator, local_asyncgen_hooks):
         finally:
             events.append("unwind 3 {}".format(ident))
         # this one is included to make sure we _don't_ execute it
-        events.append("done {}".format(ident))    # pragma: no cover
+        events.append("done {}".format(ident))  # pragma: no cover
 
     async def anext_verbosely(iter, ident):
         events.append("before asend {}".format(ident))
