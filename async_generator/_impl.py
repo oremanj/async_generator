@@ -1,5 +1,5 @@
 import sys
-from functools import wraps
+from functools import wraps, partial
 from types import coroutine, CodeType
 import inspect
 from inspect import (
@@ -50,8 +50,11 @@ _unwrapper = _unwrapper()
 
 if sys.implementation.name == "cpython" and sys.version_info >= (3, 6):
     # On 3.6, with native async generators, we want to use the same
-    # wrapper type that native generators use. This lets @async_generators
-    # yield_from_ native async generators and vice versa.
+    # wrapper type that native generators use. This lets @async_generator
+    # create a native async generator under most circumstances, which
+    # improves performance while still permitting 3.5-compatible syntax.
+    # It also lets non-native @async_generators (e.g. those that return
+    # non-None values) yield_from_ native ones and vice versa.
 
     import ctypes
     from types import AsyncGeneratorType, GeneratorType
@@ -311,10 +314,11 @@ except ImportError:
 
 
 class AsyncGenerator:
-    def __init__(self, coroutine):
+    def __init__(self, coroutine, *, warn_on_native_differences=False):
         self._coroutine = coroutine
+        self._warn_on_native_differences = warn_on_native_differences
         self._it = coroutine.__await__()
-        self.ag_running = False
+        self._running = False
         self._finalizer = None
         self._closed = False
 
@@ -345,6 +349,28 @@ class AsyncGenerator:
     @property
     def ag_frame(self):
         return self._coroutine.cr_frame
+
+    @property
+    def ag_await(self):
+        return self._coroutine.cr_await
+
+    @property
+    def ag_running(self):
+        if self._running != self._coroutine.cr_running and self._warn_on_native_differences:
+            import warnings
+            warnings.warn(
+                "Native async generators incorrectly set ag_running = False "
+                "when the generator is awaiting a trap to the event loop and "
+                "not suspended via a yield to its caller. Your code examines "
+                "ag_running under such conditions, and will change behavior "
+                "when async_generator starts using native generators by default "
+                "(where available) in the next release. "
+                "Use @async_generator_legacy to keep the current behavior, or "
+                "@async_generator_native if you're OK with the change.",
+                category=FutureWarning,
+                stacklevel=2
+            )
+        return self._running
 
     ################################################################
     # Core functionality
@@ -382,10 +408,10 @@ class AsyncGenerator:
             if self.ag_running:
                 raise ValueError("async generator already executing")
             try:
-                self.ag_running = True
+                self._running = True
                 return await ANextIter(self._it, start_fn, *args)
             finally:
-                self.ag_running = False
+                self._running = False
 
         return step()
 
@@ -454,10 +480,107 @@ if hasattr(collections.abc, "AsyncGenerator"):
     collections.abc.AsyncGenerator.register(AsyncGenerator)
 
 
-def async_generator(coroutine_maker):
-    @wraps(coroutine_maker)
+def _find_return_of_not_none(co):
+    """Inspect the code object *co* for the presence of return statements that
+    might return a value other than None. If any such statement is found,
+    return the source line number (in file ``co.co_filename``) on which it occurs.
+    If all return statements definitely return the value None, return None.
+    """
+
+    # 'return X' for simple/constant X seems to always compile to
+    # LOAD_CONST + RETURN_VALUE immediately following one another,
+    # and LOAD_CONST(None) + RETURN_VALUE definitely does mean return None,
+    # so we'll search for RETURN_VALUE not preceded by LOAD_CONST or preceded
+    # by a LOAD_CONST that does not load None.
+    import dis
+    current_line = co.co_firstlineno
+    prev_inst = None
+    for inst in dis.Bytecode(co):
+        if inst.starts_line is not None:
+            current_line = inst.starts_line
+        if inst.opname == "RETURN_VALUE" and (prev_inst is None or
+                                              prev_inst.opname != "LOAD_CONST"
+                                              or prev_inst.argval is not None):
+            return current_line
+        prev_inst = inst
+    return None
+
+
+def _convert_to_native_asyncgen_function(afn):
+    """Convert the non-generator async function *afn*, which contains some ``await yield_(...)``
+    and/or ``await yield_from_(...)`` calls, to a native async generator function.
+    *afn* must not return values other than None; doing so is likely to crash the interpreter.
+    Use :func:`_find_return_of_not_none` to check this.
+    """
+
+    # An async function that contains 'await yield_()' statements is a perfectly
+    # cromulent async generator, except that it doesn't get marked with CO_ASYNC_GENERATOR
+    # because it doesn't contain any 'yield' statements. Create a new code object that
+    # does have CO_ASYNC_GENERATOR set. This is preferable to using a wrapper because
+    # it makes ag_code and ag_frame work the same way they would for a native async
+    # generator with 'yield' statements, and the same as for an async_generator
+    # asyncgen with allow_native=False.
+
+    from inspect import CO_COROUTINE, CO_ASYNC_GENERATOR
+    co = afn.__code__
+    afn.__code__ = CodeType(
+        co.co_argcount, co.co_kwonlyargcount, co.co_nlocals, co.co_stacksize,
+        (co.co_flags & ~CO_COROUTINE) | CO_ASYNC_GENERATOR, co.co_code,
+        co.co_consts, co.co_names, co.co_varnames, co.co_filename, co.co_name,
+        co.co_firstlineno, co.co_lnotab, co.co_freevars, co.co_cellvars
+    )
+
+
+def async_generator(afn=None, *, allow_native=None, uses_return=None):
+    if afn is None:
+        return partial(
+            async_generator,
+            uses_return=uses_return,
+            allow_native=allow_native
+        )
+
+    if not inspect.iscoroutinefunction(afn):
+        raise TypeError(
+            "expected an async function, not {!r}".format(type(afn).__name__)
+        )
+
+    if sys.implementation.name == "cpython":
+        # 'return' statements with non-None arguments are syntactically forbidden when
+        # compiling a true async generator, but the flags mutation in
+        # _convert_to_native_asyncgen_function sidesteps that check, which could raise
+        # an assertion in genobject.c when a non-None return is executed.
+        # To avoid crashing the interpreter due to a user error, we need to examine the
+        # code of the function we're converting.
+
+        co = afn.__code__
+        nontrivial_return_line = _find_return_of_not_none(co)
+        seems_to_use_return = nontrivial_return_line is not None
+        if uses_return is None:
+            uses_return = seems_to_use_return
+        elif uses_return != seems_to_use_return:
+            prefix = "{} declared using @async_generator(uses_return={}) but ".format(
+                afn.__qualname__, uses_return
+            )
+            if seems_to_use_return:
+                raise RuntimeError(
+                    prefix + "might return a value other than None at {}:{}".
+                    format(co.co_filename, nontrivial_return_line)
+                )
+            else:
+                raise RuntimeError(
+                    prefix + "never returns a value other than None"
+                )
+
+        if allow_native and not uses_return and supports_native_asyncgens:
+            _convert_to_native_asyncgen_function(afn)
+            return afn
+
+    @wraps(afn)
     def async_generator_maker(*args, **kwargs):
-        return AsyncGenerator(coroutine_maker(*args, **kwargs))
+        return AsyncGenerator(
+            afn(*args, **kwargs),
+            warn_on_native_differences=(allow_native is not False)
+        )
 
     async_generator_maker._async_gen_function = id(async_generator_maker)
     return async_generator_maker
