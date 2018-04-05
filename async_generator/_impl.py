@@ -320,6 +320,7 @@ class AsyncGenerator:
         self._it = coroutine.__await__()
         self._running = False
         self._finalizer = None
+        self._closed = False
 
     # On python 3.5.0 and 3.5.1, __aiter__ must be awaitable.
     # Starting in 3.5.2, it should not be awaitable, and if it is, then it
@@ -421,12 +422,13 @@ class AsyncGenerator:
 
     async def aclose(self):
         state = getcoroutinestate(self._coroutine)
+        if state is CORO_CLOSED or self._closed:
+            return
+        self._closed = True
         if state is CORO_CREATED:
             # Make sure that aclose() on an unstarted generator returns
             # successfully and prevents future iteration.
             self._it.close()
-            return
-        elif state is CORO_CLOSED:
             return
         try:
             await self.athrow(GeneratorExit)
@@ -440,8 +442,18 @@ class AsyncGenerator:
             # Never started, nothing to clean up, just suppress the "coroutine
             # never awaited" message.
             self._coroutine.close()
-        if getcoroutinestate(self._coroutine) is CORO_SUSPENDED:
-            if self._finalizer is not None:
+        if getcoroutinestate(self._coroutine
+                             ) is CORO_SUSPENDED and not self._closed:
+            if sys.implementation.name == "pypy":
+                # pypy segfaults if we resume the coroutine from our __del__
+                # and it executes any more 'await' statements, so we use the
+                # old async_generator behavior of "don't even try to finalize
+                # correctly". https://bitbucket.org/pypy/pypy/issues/2786/
+                raise RuntimeError(
+                    "partially-exhausted async_generator {!r} garbage collected"
+                    .format(self.ag_code.co_name)
+                )
+            elif self._finalizer is not None:
                 self._finalizer(self)
             else:
                 # Mimic the behavior of native generators on GC with no finalizer:

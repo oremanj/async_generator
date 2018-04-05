@@ -697,7 +697,23 @@ async def test___del__(async_generator, capfd):
         gen = awaits_when_unwinding()
         for turn in range(1, turns + 1):
             assert await gen.__anext__() == turn
-        if turns == 2:
+
+        if sys.implementation.name == "pypy":
+            # pypy can't do the full finalization dance yet:
+            # https://bitbucket.org/pypy/pypy/issues/2786/.
+            # Also, pypy suppresses exceptions on explicit __del__ calls,
+            # not just implicit ones.
+            with pytest.raises(RuntimeError) as info:
+                gen.__del__()
+            assert "partially-exhausted async_generator" in str(info.value)
+            if turns == 3:
+                # We didn't increment completions, because we didn't finalize
+                # the generator. Increment it now so the check below (which is
+                # calibrated for the correct/CPython behavior) doesn't fire;
+                # we know about the pypy bug.
+                completions += 1
+
+        elif turns == 2:
             # Stopped in the middle of a try/finally that awaits in the finally,
             # so __del__ can't cleanup.
             if async_generator.is_native:
@@ -733,6 +749,11 @@ async def test___del__(async_generator, capfd):
         gen.__del__()
         assert "RuntimeError: async generator ignored GeneratorExit" in capfd.readouterr(
         ).err
+    elif sys.implementation.name == "pypy":
+        # same bug as above
+        with pytest.raises(RuntimeError) as info:
+            gen.__del__()
+        assert "partially-exhausted async_generator" in str(info.value)
     else:
         with pytest.raises(RuntimeError) as info:
             gen.__del__()
@@ -980,10 +1001,6 @@ def test_gc_hooks_interface(local_asyncgen_hooks):
     assert get_asyncgen_hooks() == (one, two)
 
 
-@pytest.mark.skipif(
-    sys.implementation.name == "pypy",
-    reason="segfaults - currently investigating why"
-)
 async def test_gc_hooks_behavior(async_generator, local_asyncgen_hooks):
     events = []
     to_finalize = []
@@ -1041,6 +1058,12 @@ async def test_gc_hooks_behavior(async_generator, local_asyncgen_hooks):
         "yield 1 C", "after asend C"
     ]
     del events[:]
+
+    if sys.implementation.name == "pypy":
+        # pypy segfaults if an async generator's __del__ is called (even if it resurrects!)
+        # and then the underlying coroutine encounters another await:
+        # https://bitbucket.org/pypy/pypy/issues/2786/
+        return
 
     from weakref import ref
     refA, refB, refC = map(ref, (iterA, iterB, iterC))
