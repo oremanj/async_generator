@@ -941,7 +941,7 @@ async def test_no_spurious_unawaited_coroutine_warning(recwarn, async_range):
 
 
 # Reasonable error on @async_generator of something other than an async function
-def test_asyncgen_type_error(async_generator):
+async def test_asyncgen_type_error(async_generator):
     with pytest.raises(TypeError) as info:
 
         @async_generator
@@ -957,6 +957,32 @@ def test_asyncgen_type_error(async_generator):
 
         async_generator(whoops2())
     assert "expected an async function, not 'generator'" in str(info.value)
+
+    # Make sure a sync function wrapping an async one is OK, and produces
+    # a non-native generator.
+    async def ok(val):
+        await yield_(2 * val)
+
+    @wraps(ok)
+    def wrap1(val):
+        return ok(3 * val)
+
+    @wraps(wrap1)
+    def wrap2(val):
+        return wrap1(5 * val)
+
+    gen0 = async_generator(ok)
+    gen1 = async_generator(wrap1)
+    gen2 = async_generator(wrap2)
+
+    assert await collect(gen0(10)) == [20]
+    assert await collect(gen1(10)) == [60]
+    assert await collect(gen2(10)) == [300]
+
+    if async_generator.is_native:
+        assert inspect.isasyncgenfunction(gen0)
+        assert not inspect.isasyncgenfunction(gen1)
+        assert not inspect.isasyncgenfunction(gen2)
 
 
 ################################################################

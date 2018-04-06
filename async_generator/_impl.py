@@ -1,6 +1,6 @@
 import sys
 from functools import wraps, partial
-from types import coroutine, CodeType
+from types import coroutine, CodeType, FunctionType
 import inspect
 from inspect import (
     getcoroutinestate, CORO_CREATED, CORO_CLOSED, CORO_SUSPENDED
@@ -514,9 +514,9 @@ def _find_return_of_not_none(co):
     return None
 
 
-def _convert_to_native_asyncgen_function(afn):
-    """Convert the non-generator async function *afn*, which contains some ``await yield_(...)``
-    and/or ``await yield_from_(...)`` calls, to a native async generator function.
+def _as_native_asyncgen_function(afn):
+    """Given a non-generator async function *afn*, which contains some ``await yield_(...)``
+    and/or ``await yield_from_(...)`` calls, create the analogous async generator function.
     *afn* must not return values other than None; doing so is likely to crash the interpreter.
     Use :func:`_find_return_of_not_none` to check this.
     """
@@ -531,12 +531,18 @@ def _convert_to_native_asyncgen_function(afn):
 
     from inspect import CO_COROUTINE, CO_ASYNC_GENERATOR
     co = afn.__code__
-    afn.__code__ = CodeType(
+    new_code = CodeType(
         co.co_argcount, co.co_kwonlyargcount, co.co_nlocals, co.co_stacksize,
         (co.co_flags & ~CO_COROUTINE) | CO_ASYNC_GENERATOR, co.co_code,
         co.co_consts, co.co_names, co.co_varnames, co.co_filename, co.co_name,
         co.co_firstlineno, co.co_lnotab, co.co_freevars, co.co_cellvars
     )
+    asyncgen_fn = FunctionType(
+        new_code, afn.__globals__, afn.__name__, afn.__defaults__,
+        afn.__closure__
+    )
+    asyncgen_fn.__kwdefaults__ = afn.__kwdefaults__
+    return wraps(afn)(asyncgen_fn)
 
 
 def async_generator(afn=None, *, allow_native=None, uses_return=None):
@@ -547,12 +553,28 @@ def async_generator(afn=None, *, allow_native=None, uses_return=None):
             allow_native=allow_native
         )
 
+    uses_wrapper = False
     if not inspect.iscoroutinefunction(afn):
-        raise TypeError(
-            "expected an async function, not {!r}".format(type(afn).__name__)
-        )
+        underlying = afn
+        while hasattr(underlying, "__wrapped__"):
+            underlying = getattr(underlying, "__wrapped__")
+            if inspect.iscoroutinefunction(underlying):
+                break
+        else:
+            raise TypeError(
+                "expected an async function, not {!r}".format(
+                    type(afn).__name__
+                )
+            )
+        # A sync wrapper around an async function is fine, in the sense
+        # that we can call it to get a coroutine just like we could for
+        # an async function; but it's a bit suboptimal, in the sense that
+        # we can't turn it into an async generator. One way to get here
+        # is to put trio's @enable_ki_protection decorator below
+        # @async_generator rather than above it.
+        uses_wrapper = True
 
-    if sys.implementation.name == "cpython":
+    if sys.implementation.name == "cpython" and not uses_wrapper:
         # 'return' statements with non-None arguments are syntactically forbidden when
         # compiling a true async generator, but the flags mutation in
         # _convert_to_native_asyncgen_function sidesteps that check, which could raise
@@ -580,8 +602,7 @@ def async_generator(afn=None, *, allow_native=None, uses_return=None):
                 )
 
         if allow_native and not uses_return and supports_native_asyncgens:
-            _convert_to_native_asyncgen_function(afn)
-            return afn
+            return _as_native_asyncgen_function(afn)
 
     @wraps(afn)
     def async_generator_maker(*args, **kwargs):
