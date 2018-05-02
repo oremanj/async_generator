@@ -22,7 +22,7 @@ import collections.abc
 # async generator implementation) before being yielded.
 # The __anext__(), asend(), and athrow() methods of an async generator
 # iterate the underlying async function until a wrapped value is received,
-# and any unwrapped values are passed through to the event loop.
+# and any non-wrapped values are passed through to the event loop.
 
 # These functions are syntactically valid only on 3.6+, so we conditionally
 # exec() the code defining them.
@@ -75,14 +75,14 @@ if sys.implementation.name == "cpython" and sys.version_info >= (3, 6):
     # pointer ag_finalizer, so they don't hold any resources that need
     # to be cleaned up. (We transmute the async generator to a regular
     # generator before we first iterate it, so ag_finalizer stays NULL
-    # for the lifetime of the object, and we never have an object we
-    # need to remember to drop our reference to.) We have a unit test
-    # that verifies that __sizeof__() for generators and async
-    # generators continues to follow this pattern in future Python
-    # versions.
+    # for the lifetime of the object, so failing to drop a reference
+    # to it during deallocation doesn't actually leak anything.)
+    # We have a unit test that verifies that __sizeof__() for generators
+    # and async generators continues to follow this pattern in future
+    # Python versions.
 
-    _type_p = ctypes.c_size_t.from_address(
-        id(_wrapper) + ctypes.sizeof(ctypes.c_size_t)
+    _type_p = ctypes.c_void_p.from_address(
+        id(_wrapper) + object().__sizeof__() - ctypes.sizeof(ctypes.c_void_p)
     )
     assert _type_p.value == id(AsyncGeneratorType)
     _type_p.value = id(GeneratorType)
@@ -91,7 +91,7 @@ if sys.implementation.name == "cpython" and sys.version_info >= (3, 6):
 
     # Now _wrapper.send(x) returns an AsyncGenWrappedValue of x.
     # We have to initially send(None) since the generator was just constructed;
-    # we look at the type of the return value (which is AsyncGenWrappedValue(None))
+    # we remember the type of the return value (which is AsyncGenWrappedValue(None))
     # to help with _is_wrapped.
     YieldWrapper = type(_wrapper.send(None))
 
